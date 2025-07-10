@@ -1,1 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>WebGL Ray-Marching Demo – All Features</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #controls {
+      position: absolute;
+      top: 10px; left: 10px;
+      background: rgba(0,0,0,0.6);
+      padding: 12px;
+      border-radius: 8px;
+      user-select: none;
+      line-height: 1.4;
+      max-width: 200px;
+    }
+    #controls label { display: block; margin-bottom: 6px; font-size: 0.9em; }
+    #controls input[type=range] { width: 100%; }
+    #controls select, #controls input[type=color] { width: 100%; margin-top: 4px; }
+    #controls button {
+      width: 100%;
+      margin-top: 8px;
+      padding: 6px;
+      border: none;
+      border-radius: 4px;
+      background: #333;
+      color: #eee;
+      cursor: pointer;
+      font-size: 0.9em;
+    }
+    #stats { margin-top: 8px; font-size: 0.85em; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+  <div id="controls">
+    <label>
+      Radius:
+      <input id="radius" type="range" min="0.5" max="2.5" step="0.01" value="1.00">
+      <span id="radius-val">1.00</span>
+    </label>
+    <label>
+      Shape:
+      <select id="shape">
+        <option value="0">Sphere</option>
+        <option value="1">Box</option>
+      </select>
+    </label>
+    <label>
+      Color:
+      <input id="color" type="color" value="#00aaff">
+    </label>
+    <label>
+      Light X:
+      <input id="lightX" type="range" min="-1" max="1" step="0.01" value="1.00">
+      <span id="lightX-val">1.00</span>
+    </label>
+    <label>
+      Light Y:
+      <input id="lightY" type="range" min="-1" max="1" step="0.01" value="1.00">
+      <span id="lightY-val">1.00</span>
+    </label>
+    <label>
+      Background:
+      <select id="bgToggle">
+        <option value="0">Solid</option>
+        <option value="1">Gradient</option>
+      </select>
+    </label>
+    <label>
+      Metallic:
+      <input id="metallic" type="range" min="0" max="1" step="0.01" value="0.00">
+      <span id="metallic-val">0.00</span>
+    </label>
+    <label>
+      Roughness:
+      <input id="roughness" type="range" min="0" max="1" step="0.01" value="0.50">
+      <span id="roughness-val">0.50</span>
+    </label>
+    <label>
+      AO Strength:
+      <input id="aoStrength" type="range" min="0" max="1" step="0.01" value="1.00">
+      <span id="aoStrength-val">1.00</span>
+    </label>
+    <label>
+      Soft Shadows:
+      <input id="shadowSoft" type="range" min="0.1" max="5.0" step="0.1" value="1.00">
+      <span id="shadowSoft-val">1.00</span>
+    </label>
+    <button id="screenshot">Download Screenshot</button>
+    <button id="autorotate">Auto-Rotate: Off</button>
+    <div id="stats">FPS: <span id="fps">0</span></div>
+  </div>
+
+  <!-- Vertex shader -->
+  <script id="vertshader" type="x-shader/x-vertex">
+    attribute vec4 position;
+    void main() {
+      gl_Position = position;
+    }
+  </script>
+
+  <!-- Fragment shader -->
+  <script id="fragshader" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform vec2  u_resolution;
+    uniform float u_time;
+    uniform float u_radius;
+    uniform int   u_shapeType;
+    uniform vec3  u_color;
+    uniform vec3  u_lightDir;
+    uniform int   u_bgType;
+    uniform vec3  u_cameraPos;
+    uniform mat3  u_cameraMatrix;
+    uniform float u_metallic;
+    uniform float u_roughness;
+    uniform float u_aoStrength;
+    uniform float u_shadowSoft;
+
+    #define MAX_STEPS 100
+    #define MAX_DIST 100.0
+    #define SURF_DIST 0.001
+
+    float sphereSDF(vec3 p, float r) {
+      return length(p) - r;
+    }
+    float boxSDF(vec3 p, float r) {
+      vec3 d = abs(p) - vec3(r);
+      return length(max(d,0.0)) + min(max(d.x,max(d.y,d.z)),0.0);
+    }
+    float sceneSDF(vec3 p) {
+      return (u_shapeType==0)
+        ? sphereSDF(p, u_radius)
+        : boxSDF(p, u_radius);
+    }
+    vec3 getNormal(vec3 p) {
+      float d = sceneSDF(p);
+      vec2 e = vec2(0.001, 0.0);
+      return normalize(vec3(
+        d - sceneSDF(p - e.xyy),
+        d - sceneSDF(p - e.yxy),
+        d - sceneSDF(p - e.yyx)
+      ));
+    }
+    float rayMarch(vec3 ro, vec3 rd) {
+      float dist = 0.0;
+      for(int i=0; i<MAX_STEPS; i++){
+        vec3 p = ro + rd * dist;
+        float h = sceneSDF(p);
+        dist += h;
+        if(h<SURF_DIST||dist>MAX_DIST) break;
+      }
+      return dist;
+    }
+    // AO
+    float calcAO(vec3 p, vec3 n) {
+      float occ=0.0, sca=1.0;
+      for(int i=1;i<=5;i++){
+        float h = 0.01*float(i);
+        float d = sceneSDF(p + n*h);
+        occ += (h - d)*sca;
+        sca *= 0.5;
+      }
+      return clamp(1.0 - occ, 0.0, 1.0);
+    }
+    // Soft shadows
+    float softShadow(vec3 ro, vec3 rd, float k) {
+      float res=1.0;
+      float t=0.001;
+      for(int i=0;i<50;i++){
+        float h=sceneSDF(ro + rd*t);
+        if(h<0.001) return 0.0;
+        res = min(res, k*h/t);
+        t += clamp(h,0.01,0.2);
+        if(t>MAX_DIST) break;
+      }
+      return clamp(res,0.0,1.0);
+    }
+
+    void main(){
+      vec2 uv = (gl_FragCoord.xy/u_resolution)*2.0 - 1.0;
+      uv.x *= u_resolution.x/u_resolution.y;
+
+      // background
+      if(u_bgType==1){
+        float f = uv.y*0.5 + 0.5;
+        gl_FragColor = vec4(mix(vec3(0.1,0.1,0.2), vec3(0.3,0.4,0.6), f),1.0);
+      }
+
+      vec3 ro = u_cameraPos;
+      vec3 rd = normalize(u_cameraMatrix * vec3(uv, -1.5));
+
+      float dist = rayMarch(ro, rd);
+      vec3 col = vec3(0.0);
+
+      if(dist<MAX_DIST){
+        vec3 p = ro + rd*dist;
+        vec3 n = getNormal(p);
+
+        // lighting + soft shadows
+        float diff = max(dot(n, normalize(u_lightDir)), 0.0);
+        float sh   = softShadow(p + n*SURF_DIST*2.0, normalize(u_lightDir), u_shadowSoft);
+        diff *= sh;
+
+        // diffuse
+        vec3 diffuse = u_color * diff;
+
+        // specular (Blinn-Phong roughness)
+        vec3 viewDir = normalize(u_cameraPos - p);
+        vec3 halfDir = normalize(normalize(u_lightDir) + viewDir);
+        float expVal = mix(256.0, 16.0, u_roughness);
+        float spec   = pow(max(dot(n, halfDir),0.0), expVal);
+        vec3 specular = vec3(spec);
+
+        // mix based on metallic
+        col = mix(diffuse, specular, u_metallic);
+
+        // ambient occlusion
+        float ao = mix(1.0, calcAO(p,n), u_aoStrength);
+        col *= ao;
+
+        gl_FragColor = vec4(col,1.0);
+      } else if(u_bgType==0){
+        gl_FragColor = vec4(0.05,0.05,0.08,1.0);
+      }
+    }
+  </script>
+
+  <script>
+    (function(){
+      const canvas = document.getElementById('glcanvas');
+      const gl = canvas.getContext('webgl');
+      if(!gl) return alert('WebGL not supported');
+
+      // resize
+      function resize(){
+        canvas.width = innerWidth;
+        canvas.height = innerHeight;
+        gl.viewport(0,0,canvas.width,canvas.height);
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      // compile helper
+      function compile(type, src){
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+          console.error(gl.getShaderInfoLog(s));
+        }
+        return s;
+      }
+
+      // build program
+      const vs = compile(gl.VERTEX_SHADER, document.getElementById('vertshader').text);
+      const fs = compile(gl.FRAGMENT_SHADER, document.getElementById('fragshader').text);
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.linkProgram(prog);
+      gl.useProgram(prog);
+
+      // fullscreen quad
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1, -1,  1, -1,  -1, 1,  1, 1
+      ]), gl.STATIC_DRAW);
+      const posLoc = gl.getAttribLocation(prog, 'position');
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+      // uniform locations
+      const U = {
+        resolution: gl.getUniformLocation(prog,'u_resolution'),
+        time:       gl.getUniformLocation(prog,'u_time'),
+        radius:     gl.getUniformLocation(prog,'u_radius'),
+        shapeType:  gl.getUniformLocation(prog,'u_shapeType'),
+        color:      gl.getUniformLocation(prog,'u_color'),
+        lightDir:   gl.getUniformLocation(prog,'u_lightDir'),
+        bgType:     gl.getUniformLocation(prog,'u_bgType'),
+        cameraPos:  gl.getUniformLocation(prog,'u_cameraPos'),
+        cameraMatrix: gl.getUniformLocation(prog,'u_cameraMatrix'),
+        metallic:   gl.getUniformLocation(prog,'u_metallic'),
+        roughness:  gl.getUniformLocation(prog,'u_roughness'),
+        aoStrength: gl.getUniformLocation(prog,'u_aoStrength'),
+        shadowSoft: gl.getUniformLocation(prog,'u_shadowSoft'),
+      };
+
+      // UI
+      function $(id){ return document.getElementById(id); }
+      const ui = {
+        radius:   $('radius'),   radiusVal: $('radius-val'),
+        shape:    $('shape'),
+        color:    $('color'),
+        lightX:   $('lightX'),   lightXVal: $('lightX-val'),
+        lightY:   $('lightY'),   lightYVal: $('lightY-val'),
+        bgToggle: $('bgToggle'),
+        metallic: $('metallic'), metallicVal: $('metallic-val'),
+        roughness: $('roughness'), roughnessVal: $('roughness-val'),
+        ao:       $('aoStrength'), aoVal: $('aoStrength-val'),
+        shadow:   $('shadowSoft'), shadowVal: $('shadowSoft-val'),
+        screenshot: $('screenshot'),
+        autorotate: $('autorotate'),
+        fps:      $('fps')
+      };
+
+      // screenshot
+      ui.screenshot.onclick = ()=>{
+        const a = document.createElement('a');
+        a.href = canvas.toDataURL('image/png');
+        a.download = 'snapshot.png';
+        a.click();
+      };
+
+      // auto-rotate
+      let rotating = false;
+      ui.autorotate.onclick = ()=>{
+        rotating = !rotating;
+        ui.autorotate.textContent = rotating ? 'Auto-Rotate: On' : 'Auto-Rotate: Off';
+      };
+
+      // orbit controls
+      let yaw=0, pitch=0, isDrag=false, lastX=0, lastY=0;
+      const sens=0.005;
+      canvas.addEventListener('mousedown', e=>{
+        isDrag=true; lastX=e.clientX; lastY=e.clientY;
+      });
+      window.addEventListener('mousemove', e=>{
+        if(!isDrag) return;
+        const dx = e.clientX - lastX, dy = e.clientY - lastY;
+        lastX=e.clientX; lastY=e.clientY;
+        yaw   += dx*sens;
+        pitch  = Math.max(-Math.PI/2+0.1, Math.min(Math.PI/2-0.1, pitch+dy*sens));
+      });
+      window.addEventListener('mouseup', ()=>{ isDrag=false; });
+
+      function computeCamera(){
+        const r=5.0;
+        return [
+          r*Math.cos(pitch)*Math.sin(yaw),
+          r*Math.sin(pitch),
+          r*Math.cos(pitch)*Math.cos(yaw)
+        ];
+      }
+
+      // update all uniforms from UI
+      function updateUniforms(){
+        gl.uniform2f(U.resolution, canvas.width, canvas.height);
+
+        gl.uniform1f(U.radius, parseFloat(ui.radius.value));
+        gl.uniform1i(U.shapeType, parseInt(ui.shape.value));
+
+        const hex = ui.color.value;
+        gl.uniform3f(U.color,
+          parseInt(hex.substr(1,2),16)/255,
+          parseInt(hex.substr(3,2),16)/255,
+          parseInt(hex.substr(5,2),16)/255
+        );
+
+        gl.uniform3f(U.lightDir,
+          parseFloat(ui.lightX.value),
+          parseFloat(ui.lightY.value),
+          0.5
+        );
+        gl.uniform1i(U.bgType, parseInt(ui.bgToggle.value));
+
+        gl.uniform1f(U.metallic,  parseFloat(ui.metallic.value));
+        gl.uniform1f(U.roughness, parseFloat(ui.roughness.value));
+        gl.uniform1f(U.aoStrength,parseFloat(ui.ao.value));
+        gl.uniform1f(U.shadowSoft, parseFloat(ui.shadow.value));
+
+        // update display values
+        ui.radiusVal.textContent    = parseFloat(ui.radius.value).toFixed(2);
+        ui.lightXVal.textContent    = parseFloat(ui.lightX.value).toFixed(2);
+        ui.lightYVal.textContent    = parseFloat(ui.lightY.value).toFixed(2);
+        ui.metallicVal.textContent  = parseFloat(ui.metallic.value).toFixed(2);
+        ui.roughnessVal.textContent = parseFloat(ui.roughness.value).toFixed(2);
+        ui.aoVal.textContent        = parseFloat(ui.ao.value).toFixed(2);
+        ui.shadowVal.textContent    = parseFloat(ui.shadow.value).toFixed(2);
+      }
+
+      // attach UI listeners
+      [
+        ui.radius, ui.shape, ui.color,
+        ui.lightX, ui.lightY,
+        ui.bgToggle,
+        ui.metallic, ui.roughness,
+        ui.ao, ui.shadow
+      ].forEach(el => el.addEventListener('input', updateUniforms));
+
+      updateUniforms();
+
+      // render loop & FPS
+      let lastTime = performance.now(), frames=0;
+      const startTime = lastTime;
+      function render(now){
+        const t = (now - startTime) * 0.001;
+        gl.uniform1f(U.time, rotating ? t : 0.0);
+
+        // orbit camera uniforms
+        const cam = computeCamera();
+        gl.uniform3f(U.cameraPos, cam[0], cam[1], cam[2]);
+        gl.uniformMatrix3fv(U.cameraMatrix, false, new Float32Array([
+          Math.cos(yaw), 0, -Math.sin(yaw),
+          Math.sin(pitch)*Math.sin(yaw), Math.cos(pitch), Math.sin(pitch)*Math.cos(yaw),
+          Math.cos(pitch)*Math.sin(yaw), -Math.sin(pitch), Math.cos(pitch)*Math.cos(yaw)
+        ]));
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>WebGL Ray-Marching Demo – All Features</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #controls {
+      position: absolute;
+      top: 10px; left: 10px;
+      background: rgba(0,0,0,0.6);
+      padding: 12px;
+      border-radius: 8px;
+      user-select: none;
+      line-height: 1.4;
+      max-width: 260px;
+    }
+    #controls label { display: block; margin-bottom: 6px; font-size: 0.9em; }
+    #controls input[type=range],
+    #controls select,
+    #controls input[type=color] { width: 100%; margin-top: 4px; }
+    #controls button {
+      width: 100%; margin-top: 8px;
+      padding: 6px; border: none; border-radius: 4px;
+      background: #333; color: #eee; cursor: pointer; font-size: 0.9em;
+    }
+    #stats { margin-top: 8px; font-size: 0.85em; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+  <div id="controls">
+    <label>Radius:<input id="radius" type="range" min="0.5" max="2.5" step="0.01" value="1.00"><span id="radius-val">1.00</span></label>
+    <label>Shape:<select id="shape"><option value="0">Sphere</option><option value="1">Box</option></select></label>
+    <label>Color:<input id="color" type="color" value="#00aaff"></label>
+    <label>Light X:<input id="lightX" type="range" min="-1" max="1" step="0.01" value="1.00"><span id="lightX-val">1.00</span></label>
+    <label>Light Y:<input id="lightY" type="range" min="-1" max="1" step="0.01" value="1.00"><span id="lightY-val">1.00</span></label>
+    <label>Background:<select id="bgToggle"><option value="0">Solid</option><option value="1">Gradient</option></select></label>
+    <label>Metallic:<input id="metallic" type="range" min="0" max="1" step="0.01" value="0.00"><span id="metallic-val">0.00</span></label>
+    <label>Roughness:<input id="roughness" type="range" min="0" max="1" step="0.01" value="0.50"><span id="roughness-val">0.50</span></label>
+    <label>AO Strength:<input id="aoStrength" type="range" min="0" max="1" step="0.01" value="1.00"><span id="aoStrength-val">1.00</span></label>
+    <label>Soft Shadows:<input id="shadowSoft" type="range" min="0.1" max="5.0" step="0.1" value="1.00"><span id="shadowSoft-val">1.00</span></label>
+    <label>Object X:<input id="objX" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objX-val">0.00</span></label>
+    <label>Object Y:<input id="objY" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objY-val">0.00</span></label>
+    <label>Object Z:<input id="objZ" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objZ-val">0.00</span></label>
+    <label>Plane Height:<input id="planeHeight" type="range" min="-2" max="2" step="0.01" value="0.00"><span id="planeHeight-val">0.00</span></label>
+    <button id="screenshot">Download Screenshot</button>
+    <button id="autorotate">Auto-Rotate: Off</button>
+    <div id="stats">FPS: <span id="fps">0</span></div>
+  </div>
+
+  <!-- Vertex shader -->
+  <script id="vertshader" type="x-shader/x-vertex">
+    attribute vec4 position;
+    void main() {
+      gl_Position = position;
+    }
+  </script>
+
+  <!-- Fragment shader -->
+  <script id="fragshader" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform vec2  u_resolution;
+    uniform float u_time;
+    uniform float u_radius;
+    uniform int   u_shapeType;
+    uniform vec3  u_color;
+    uniform vec3  u_lightDir;
+    uniform int   u_bgType;
+    uniform vec3  u_cameraPos;
+    uniform mat3  u_cameraMatrix;
+    uniform float u_metallic;
+    uniform float u_roughness;
+    uniform float u_aoStrength;
+    uniform float u_shadowSoft;
+    uniform vec3  u_objPos;
+    uniform float u_planeHeight;
+
+    #define MAX_STEPS 100
+    #define MAX_DIST 100.0
+    #define SURF_DIST 0.001
+
+    // basic SDFs
+    float sphereSDF(vec3 p, float r) { return length(p) - r; }
+    float boxSDF(vec3 p, float r) {
+      vec3 d = abs(p) - vec3(r);
+      return length(max(d,0.0)) + min(max(d.x,max(d.y,d.z)),0.0);
+    }
+    float shapeSDF(vec3 p) {
+      return (u_shapeType==0)
+        ? sphereSDF(p, u_radius)
+        : boxSDF(p, u_radius);
+    }
+    float planeSDF(vec3 p) {
+      return p.y + u_planeHeight;
+    }
+    // union
+    float sceneSDF(vec3 p) {
+      float dObj   = shapeSDF(p - u_objPos);
+      float dPlane = planeSDF(p);
+      return min(dObj, dPlane);
+    }
+    vec3 getNormal(vec3 p) {
+      float d = sceneSDF(p);
+      vec2 e = vec2(0.001, 0.0);
+      return normalize(vec3(
+        d - sceneSDF(p - e.xyy),
+        d - sceneSDF(p - e.yxy),
+        d - sceneSDF(p - e.yyx)
+      ));
+    }
+    float rayMarch(vec3 ro, vec3 rd) {
+      float dist = 0.0;
+      for(int i=0;i<MAX_STEPS;i++){
+        vec3 p = ro + rd*dist;
+        float h = sceneSDF(p);
+        dist += h;
+        if(h<SURF_DIST||dist>MAX_DIST) break;
+      }
+      return dist;
+    }
+    // AO
+    float calcAO(vec3 p, vec3 n) {
+      float occ=0.0, sca=1.0;
+      for(int i=1;i<=5;i++){
+        float h = 0.01*float(i);
+        float d = sceneSDF(p + n*h);
+        occ += (h - d)*sca;
+        sca *= 0.5;
+      }
+      return clamp(1.0 - occ, 0.0, 1.0);
+    }
+    // soft shadows
+    float softShadow(vec3 ro, vec3 rd, float k) {
+      float res=1.0;
+      float t=0.001;
+      for(int i=0;i<50;i++){
+        float h = sceneSDF(ro + rd*t);
+        if(h<0.001) return 0.0;
+        res = min(res, k*h/t);
+        t += clamp(h,0.01,0.2);
+        if(t>MAX_DIST) break;
+      }
+      return clamp(res,0.0,1.0);
+    }
+
+    void main(){
+      vec2 uv = (gl_FragCoord.xy/u_resolution)*2.0 - 1.0;
+      uv.x *= u_resolution.x/u_resolution.y;
+
+      // background
+      if(u_bgType==1){
+        float f = uv.y*0.5 + 0.5;
+        gl_FragColor = vec4(mix(vec3(0.1,0.1,0.2), vec3(0.3,0.4,0.6), f),1.0);
+      }
+
+      vec3 ro = u_cameraPos;
+      vec3 rd = normalize(u_cameraMatrix * vec3(uv, -1.5));
+
+      float dist = rayMarch(ro, rd);
+      vec3 col = vec3(0.0);
+
+      if(dist<MAX_DIST){
+        vec3 p = ro + rd*dist;
+        // determine hit
+        float dObj   = shapeSDF(p - u_objPos);
+        float dPlane = planeSDF(p);
+        bool hitPlane = dPlane < dObj;
+        vec3 n = getNormal(p);
+
+        // lighting + shadows
+        float diff = max(dot(n, normalize(u_lightDir)), 0.0);
+        float sh   = softShadow(p + n*SURF_DIST*2.0, normalize(u_lightDir), u_shadowSoft);
+        diff *= sh;
+
+        // base color
+        vec3 baseCol = hitPlane ? vec3(0.3) : u_color;
+        vec3 diffuse = baseCol * diff;
+
+        // specular
+        vec3 viewDir = normalize(u_cameraPos - p);
+        vec3 halfDir = normalize(normalize(u_lightDir) + viewDir);
+        float expVal = mix(256.0, 16.0, u_roughness);
+        float spec   = pow(max(dot(n, halfDir),0.0), expVal);
+        vec3 specular = vec3(spec);
+
+        // mix
+        col = mix(diffuse, specular, hitPlane ? 0.0 : u_metallic);
+
+        // AO
+        float ao = mix(1.0, calcAO(p,n), u_aoStrength);
+        col *= ao;
+
+        gl_FragColor = vec4(col,1.0);
+      } else if(u_bgType==0) {
+        gl_FragColor = vec4(0.05,0.05,0.08,1.0);
+      }
+    }
+  </script>
+
+  <script>
+    (function(){
+      const canvas = document.getElementById('glcanvas');
+      const gl = canvas.getContext('webgl');
+      if(!gl) return alert('WebGL not supported');
+
+      // resize
+      function resize(){ canvas.width=innerWidth; canvas.height=innerHeight; gl.viewport(0,0,canvas.width,canvas.height); }
+      window.addEventListener('resize', resize); resize();
+
+      // compile
+      function compile(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; }
+      const vs = compile(gl.VERTEX_SHADER, document.getElementById('vertshader').text);
+      const fs = compile(gl.FRAGMENT_SHADER, document.getElementById('fragshader').text);
+      const prog = gl.createProgram(); gl.attachShader(prog,vs); gl.attachShader(prog,fs); gl.linkProgram(prog); gl.useProgram(prog);
+
+      // quad
+      const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+      gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+      const posLoc = gl.getAttribLocation(prog,'position'); gl.enableVertexAttribArray(posLoc); gl.vertexAttribPointer(posLoc,2,gl.FLOAT,false,0,0);
+
+      // uniforms
+      const U = {
+        resolution: gl.getUniformLocation(prog,'u_resolution'),
+        time:       gl.getUniformLocation(prog,'u_time'),
+        radius:     gl.getUniformLocation(prog,'u_radius'),
+        shapeType:  gl.getUniformLocation(prog,'u_shapeType'),
+        color:      gl.getUniformLocation(prog,'u_color'),
+        lightDir:   gl.getUniformLocation(prog,'u_lightDir'),
+        bgType:     gl.getUniformLocation(prog,'u_bgType'),
+        cameraPos:  gl.getUniformLocation(prog,'u_cameraPos'),
+        cameraMatrix: gl.getUniformLocation(prog,'u_cameraMatrix'),
+        metallic:   gl.getUniformLocation(prog,'u_metallic'),
+        roughness:  gl.getUniformLocation(prog,'u_roughness'),
+        aoStrength: gl.getUniformLocation(prog,'u_aoStrength'),
+        shadowSoft: gl.getUniformLocation(prog,'u_shadowSoft'),
+        objPos:     gl.getUniformLocation(prog,'u_objPos'),
+        planeHeight: gl.getUniformLocation(prog,'u_planeHeight')
+      };
+
+      // UI elements
+      function $(id){return document.getElementById(id);}      
+      const ui = {
+        radius:   $('radius'),   radiusVal:$('radius-val'),
+        shape:    $('shape'),
+        color:    $('color'),
+        lightX:   $('lightX'), lightXVal:$('lightX-val'),
+        lightY:   $('lightY'), lightYVal:$('lightY-val'),
+        bgToggle: $('bgToggle'),
+        metallic: $('metallic'), metallicVal:$('metallic-val'),
+        roughness:$('roughness'), roughnessVal:$('roughness-val'),
+        ao:       $('aoStrength'), aoVal:$('aoStrength-val'),
+        shadow:   $('shadowSoft'), shadowVal:$('shadowSoft-val'),
+        objX:     $('objX'),  objXVal:$('objX-val'),
+        objY:     $('objY'),  objYVal:$('objY-val'),
+        objZ:     $('objZ'),  objZVal:$('objZ-val'),
+        plane:    $('planeHeight'), planeVal:$('planeHeight-val'),
+        screenshot:$('screenshot'),
+        autorotate:$('autorotate'),
+        fps:      $('fps')
+      };
+
+      // screenshot
+      ui.screenshot.onclick = ()=>{ const a=document.createElement('a'); a.href=canvas.toDataURL('image/png'); a.download='snapshot.png'; a.click(); };
+      // auto-rotate
+      let rotating=false;
+      ui.autorotate.onclick = ()=>{ rotating=!rotating; ui.autorotate.textContent = rotating?'Auto-Rotate: On':'Auto-Rotate: Off'; };
+
+      // orbit controls
+      let yaw=0, pitch=0, dragging=false, lx=0, ly=0;
+      const sens=0.005;
+      canvas.addEventListener('mousedown',e=>{dragging=true; lx=e.clientX; ly=e.clientY;});
+      window.addEventListener('mousemove',e=>{ if(!dragging) return; let dx=e.clientX-lx, dy=e.clientY-ly; lx=e.clientX; ly=e.clientY; yaw+=dx*sens; pitch=Math.max(-Math.PI/2+0.1,Math.min(Math.PI/2-0.1,pitch+dy*sens)); });
+      window.addEventListener('mouseup',()=>{dragging=false;});
+      function computeCamera(){ const r=5.0; return [r*Math.cos(pitch)*Math.sin(yaw), r*Math.sin(pitch), r*Math.cos(pitch)*Math.cos(yaw)]; }
+
+      // update uniforms
+      function updateUniforms(){
+        gl.uniform2f(U.resolution,canvas.width,canvas.height);
+        gl.uniform1f(U.radius,parseFloat(ui.radius.value));
+        gl.uniform1i(U.shapeType,parseInt(ui.shape.value));
+        const hex=ui.color.value;
+        gl.uniform3f(U.color, parseInt(hex.substr(1,2),16)/255, parseInt(hex.substr(3,2),16)/255, parseInt(hex.substr(5,2),16)/255);
+        gl.uniform3f(U.lightDir, parseFloat(ui.lightX.value), parseFloat(ui.lightY.value), 0.5);
+        gl.uniform1i(U.bgType,parseInt(ui.bgToggle.value));
+        gl.uniform1f(U.metallic, parseFloat(ui.metallic.value));
+        gl.uniform1f(U.roughness, parseFloat(ui.roughness.value));
+        gl.uniform1f(U.aoStrength, parseFloat(ui.ao.value));
+        gl.uniform1f(U.shadowSoft, parseFloat(ui.shadow.value));
+        gl.uniform3f(U.objPos, parseFloat(ui.objX.value), parseFloat(ui.objY.value), parseFloat(ui.objZ.value));
+        gl.uniform1f(U.planeHeight, parseFloat(ui.plane.value));
+        // UI labels
+        ui.radiusVal.textContent = parseFloat(ui.radius.value).toFixed(2);
+        ui.lightXVal.textContent = parseFloat(ui.lightX.value).toFixed(2);
+        ui.lightYVal.textContent = parseFloat(ui.lightY.value).toFixed(2);
+        ui.metallicVal.textContent = parseFloat(ui.metallic.value).toFixed(2);
+        ui.roughnessVal.textContent = parseFloat(ui.roughness.value).toFixed(2);
+        ui.aoVal.textContent       = parseFloat(ui.ao.value).toFixed(2);
+        ui.shadowVal.textContent   = parseFloat(ui.shadow.value).toFixed(2);
+        ui.objXVal.textContent     = parseFloat(ui.objX.value).toFixed(2);
+        ui.objYVal.textContent     = parseFloat(ui.objY.value).toFixed(2);
+        ui.objZVal.textContent     = parseFloat(ui.objZ.value).
+
+        updateUniforms();
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        // FPS
+        frames++;
+        if(now - lastTime >= 1000){
+          ui.fps.textContent = frames;
+          frames = 0;
+          lastTime = now;
+        }
+
+        requestAnimationFrame(render);
+      }
+      requestAnimationFrame(render);
+    })();
+  </script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>WebGL Ray-Marching Demo – All Features + Fog</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #controls {
+      position: absolute; top: 10px; left: 10px;
+      background: rgba(0,0,0,0.6); padding: 12px; border-radius: 8px;
+      user-select: none; line-height: 1.4; max-width: 260px;
+    }
+    #controls label { display: block; margin-bottom: 6px; font-size: 0.9em; }
+    #controls input[type=range], #controls select, #controls input[type=color] {
+      width: 100%; margin-top: 4px;
+    }
+    #controls button {
+      width: 100%; margin-top: 8px; padding: 6px; border: none;
+      border-radius: 4px; background: #333; color: #eee;
+      cursor: pointer; font-size: 0.9em;
+    }
+    #stats { margin-top: 8px; font-size: 0.85em; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+  <div id="controls">
+    <label>Radius:<input id="radius" type="range" min="0.5" max="2.5" step="0.01" value="1.00"><span id="radius-val">1.00</span></label>
+    <label>Shape:<select id="shape"><option value="0">Sphere</option><option value="1">Box</option></select></label>
+    <label>Color:<input id="color" type="color" value="#00aaff"></label>
+    <label>Light X:<input id="lightX" type="range" min="-1" max="1" step="0.01" value="1.00"><span id="lightX-val">1.00</span></label>
+    <label>Light Y:<input id="lightY" type="range" min="-1" max="1" step="0.01" value="1.00"><span id="lightY-val">1.00</span></label>
+    <label>Background:<select id="bgToggle"><option value="0">Solid</option><option value="1">Gradient</option></select></label>
+    <label>Metallic:<input id="metallic" type="range" min="0" max="1" step="0.01" value="0.00"><span id="metallic-val">0.00</span></label>
+    <label>Roughness:<input id="roughness" type="range" min="0" max="1" step="0.01" value="0.50"><span id="roughness-val">0.50</span></label>
+    <label>AO Strength:<input id="aoStrength" type="range" min="0" max="1" step="0.01" value="1.00"><span id="aoStrength-val">1.00</span></label>
+    <label>Soft Shadows:<input id="shadowSoft" type="range" min="0.1" max="5.0" step="0.1" value="1.00"><span id="shadowSoft-val">1.00</span></label>
+    <label>Fog Strength:<input id="fogStrength" type="range" min="0" max="1" step="0.01" value="0.00"><span id="fogStrength-val">0.00</span></label>
+    <label>Object X:<input id="objX" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objX-val">0.00</span></label>
+    <label>Object Y:<input id="objY" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objY-val">0.00</span></label>
+    <label>Object Z:<input id="objZ" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objZ-val">0.00</span></label>
+    <label>Plane Height:<input id="planeHeight" type="range" min="-2" max="2" step="0.01" value="0.00"><span id="planeHeight-val">0.00</span></label>
+    <button id="screenshot">Download Screenshot</button>
+    <button id="autorotate">Auto-Rotate: Off</button>
+    <div id="stats">FPS: <span id="fps">0</span></div>
+  </div>
+
+  <!-- Vertex shader -->
+  <script id="vertshader" type="x-shader/x-vertex">
+    attribute vec4 position;
+    void main() { gl_Position = position; }
+  </script>
+
+  <!-- Fragment shader -->
+  <script id="fragshader" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform vec2  u_resolution;
+    uniform float u_time;
+    uniform float u_radius;
+    uniform int   u_shapeType;
+    uniform vec3  u_color;
+    uniform vec3  u_lightDir;
+    uniform int   u_bgType;
+    uniform vec3  u_cameraPos;
+    uniform mat3  u_cameraMatrix;
+    uniform float u_metallic;
+    uniform float u_roughness;
+    uniform float u_aoStrength;
+    uniform float u_shadowSoft;
+    uniform float u_fogStrength;
+    uniform vec3  u_objPos;
+    uniform float u_planeHeight;
+
+    #define MAX_STEPS 100
+    #define MAX_DIST 100.0
+    #define SURF_DIST 0.001
+
+    float sphereSDF(vec3 p, float r) { return length(p) - r; }
+    float boxSDF(vec3 p, float r) {
+      vec3 d = abs(p) - vec3(r);
+      return length(max(d,0.0)) + min(max(d.x,max(d.y,d.z)),0.0);
+    }
+    float shapeSDF(vec3 p) {
+      return (u_shapeType==0) ? sphereSDF(p,u_radius) : boxSDF(p,u_radius);
+    }
+    float planeSDF(vec3 p) { return p.y + u_planeHeight; }
+    float sceneSDF(vec3 p) {
+      float d1 = shapeSDF(p - u_objPos);
+      float d2 = planeSDF(p);
+      return min(d1,d2);
+    }
+    vec3 getNormal(vec3 p) {
+      float d = sceneSDF(p);
+      vec2 e = vec2(0.001,0.0);
+      return normalize(vec3(
+        d - sceneSDF(p - e.xyy),
+        d - sceneSDF(p - e.yxy),
+        d - sceneSDF(p - e.yyx)
+      ));
+    }
+    float rayMarch(vec3 ro, vec3 rd) {
+      float dist = 0.0;
+      for(int i=0;i<MAX_STEPS;i++){
+        vec3 p = ro + rd*dist;
+        float h = sceneSDF(p);
+        dist += h;
+        if(h<SURF_DIST||dist>MAX_DIST) break;
+      }
+      return dist;
+    }
+    float calcAO(vec3 p, vec3 n){
+      float occ=0.0, sc=1.0;
+      for(int i=1;i<=5;i++){
+        float h=0.01*float(i);
+        float d=sceneSDF(p+n*h);
+        occ+=(h-d)*sc;
+        sc*=0.5;
+      }
+      return clamp(1.0-occ,0.0,1.0);
+    }
+    float softShadow(vec3 ro, vec3 rd, float k){
+      float res=1.0, t=0.001;
+      for(int i=0;i<50;i++){
+        float h=sceneSDF(ro+rd*t);
+        if(h<0.001) return 0.0;
+        res=min(res,k*h/t);
+        t+=clamp(h,0.01,0.2);
+        if(t>MAX_DIST) break;
+      }
+      return clamp(res,0.0,1.0);
+    }
+
+    void main(){
+      vec2 uv=(gl_FragCoord.xy/u_resolution)*2.0-1.0;
+      uv.x*=u_resolution.x/u_resolution.y;
+
+      // background blend
+      vec3 bg0 = vec3(0.05);
+      vec3 bg1 = mix(vec3(0.1,0.1,0.2), vec3(0.3,0.4,0.6), (uv.y*0.5+0.5));
+      vec3 bgCol = mix(bg0, bg1, float(u_bgType));
+
+      vec3 ro = u_cameraPos;
+      vec3 rd = normalize(u_cameraMatrix * vec3(uv, -1.5));
+
+      float dist = rayMarch(ro, rd);
+      vec3 col = bgCol;
+
+      if(dist < MAX_DIST){
+        vec3 p = ro + rd*dist;
+        float d1 = shapeSDF(p - u_objPos);
+        float d2 = planeSDF(p);
+        bool hitPlane = d2 < d1;
+        vec3 n = getNormal(p);
+
+        // lighting & shadows
+        float diff = max(dot(n, normalize(u_lightDir)), 0.0);
+        float sh = softShadow(p + n*SURF_DIST*2.0, normalize(u_lightDir), u_shadowSoft);
+        diff *= sh;
+
+        vec3 baseCol = hitPlane ? vec3(0.3) : u_color;
+        vec3 difCol = baseCol * diff;
+
+        // specular
+        vec3 viewDir = normalize(u_cameraPos - p);
+        vec3 halfDir = normalize(normalize(u_lightDir) + viewDir);
+        float expVal = mix(256.0, 16.0, u_roughness);
+        float spec = pow(max(dot(n, halfDir), 0.0), expVal);
+        vec3 specCol = vec3(spec);
+
+        col = mix(difCol, specCol, hitPlane ? 0.0 : u_metallic);
+
+        // ambient occlusion
+        float ao = mix(1.0, calcAO(p, n), u_aoStrength);
+        col *= ao;
+
+        // fog
+        float fogFactor = clamp(dist / MAX_DIST, 0.0, u_fogStrength);
+        col = mix(col, bgCol, fogFactor);
+      }
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  </script>
+
+  <script>
+    (function(){
+      const canvas = document.getElementById('glcanvas');
+      const gl = canvas.getContext('webgl'); if(!gl) return alert('WebGL not supported');
+      function resize(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; gl.viewport(0, 0, canvas.width, canvas.height); }
+      window.addEventListener('resize', resize); resize();
+
+      function compile(type, src){ const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; }
+      const vs = compile(gl.VERTEX_SHADER, document.getElementById('vertshader').text);
+      const fs = compile(gl.FRAGMENT_SHADER, document.getElementById('fragshader').text);
+      const prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
+
+      const buffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+      const posLoc = gl.getAttribLocation(prog, 'position'); gl.enableVertexAttribArray(posLoc); gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+      const U = {
+        resolution: gl.getUniformLocation(prog,'u_resolution'),
+        time:       gl.getUniformLocation(prog,'u_time'),
+        radius:     gl.getUniformLocation(prog,'u_radius'),
+        shapeType:  gl.getUniformLocation(prog,'u_shapeType'),
+        color:      gl.getUniformLocation(prog,'u_color'),
+        lightDir:   gl.getUniformLocation(prog,'u_lightDir'),
+        bgType:     gl.getUniformLocation(prog,'u_bgType'),
+        cameraPos:  gl.getUniformLocation(prog,'u_cameraPos'),
+        cameraMatrix: gl.getUniformLocation(prog,'u_cameraMatrix'),
+        metallic:   gl.getUniformLocation(prog,'u_metallic'),
+        roughness:  gl.getUniformLocation(prog,'u_roughness'),
+        aoStrength: gl.getUniformLocation(prog,'u_aoStrength'),
+        shadowSoft: gl.getUniformLocation(prog,'u_shadowSoft'),
+        fogStrength:gl.getUniformLocation(prog,'u_fogStrength'),
+        objPos:     gl.getUniformLocation(prog,'u_objPos'),
+        planeHeight:gl.getUniformLocation(prog,'u_planeHeight')
+      };
+
+      function $(id){ return document.getElementById(id); }
+      const ui = {
+        radius: $('radius'), radiusVal: $('radius-val'),
+        shape: $('shape'),
+        color: $('color'),
+        lightX: $('lightX'), lightXVal: $('lightX-val'),
+        lightY: $('lightY'), lightYVal: $('lightY-val'),
+        bgToggle: $('bgToggle'),
+        metallic: $('metallic'), metallicVal: $('metallic-val'),
+        roughness: $('roughness'), roughnessVal: $('roughness-val'),
+        ao: $('aoStrength'), aoVal: $('aoStrength-val'),
+        shadow: $('shadowSoft'), shadowVal: $('shadowSoft-val'),
+        fog: $('fogStrength'), fogVal: $('fogStrength-val'),
+        objX: $('objX'), objXVal: $('objX-val'),
+        objY: $('objY'), objYVal: $('objY-val'),
+        objZ: $('objZ'), objZVal: $('objZ-val'),
+        plane: $('planeHeight'), planeVal: $('planeHeight-val'),
+        screenshot: $('screenshot'), autorotate: $('autorotate'), fps: $('fps')
+      };
+
+      ui.screenshot.onclick = ()=>{ const a=document.createElement('a'); a.href=canvas.toDataURL(); a.download='snapshot.png'; a.click(); };
+      let rotating=false; ui.autorotate.onclick = ()=>{ rotating=!rotating; ui.autorotate.textContent = rotating ? 'Auto-Rotate: On' : 'Auto-Rotate: Off'; };
+
+      let yaw=0, pitch=0, dragging=false, lastX=0, lastY=0; const sens=0.005;
+      canvas.addEventListener('mousedown', e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; });
+      window.addEventListener('mousemove', e=>{ if(!dragging) return; const dx=e.clientX-lastX, dy=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY; yaw+=dx*sens; pitch=Math.max(-Math.PI/2+0.1, Math.min(Math.PI/2-0.1, pitch+dy*sens)); });
+      window.addEventListener('mouseup', ()=>{ dragging=false; });
+      function computeCamera(){ const r=5.0; return [r*Math.cos(pitch)*Math.sin(yaw), r*Math.sin(pitch), r*Math.cos(pitch)*Math.cos(yaw)]; }
+
+      function updateUniforms(){
+        gl.uniform2f(U.resolution, canvas.width, canvas.height);
+        gl.uniform1f(U.radius, parseFloat(ui.radius.value));
+        gl.uniform1i(U.shapeType, parseInt(ui.shape.value));
+        const hex=ui.color.value; gl.uniform3f(U.color, parseInt(hex.substr(1,2),16)/255, parseInt(hex.substr(3,2),16)/255, parseInt(hex.substr(5,2),16)/255);
+        gl.uniform3f(U.lightDir, parseFloat(ui.lightX.value), parseFloat(ui.lightY.value), 0.5);
+        gl.uniform1i(U.bgType, parseInt(ui.bgToggle.value));
+        gl.uniform1f(U.metallic, parseFloat(ui.metallic.value)); gl.uniform1f(U.roughness, parseFloat(ui.roughness.value));
+        gl.uniform1f(U.aoStrength, parseFloat(ui.ao.value)); gl.uniform1f(U.shadowSoft, parseFloat(ui.shadow.value));
+        gl.uniform1f(U.fogStrength, parseFloat(ui.fog.value));
+        gl.uniform3f(U.objPos, parseFloat(ui.objX.value), parseFloat(ui.objY.value), parseFloat(ui.objZ.value));
+        gl.uniform1f(U.planeHeight, parseFloat(ui.plane.value));
+
+        ui.radiusVal.textContent    = parseFloat(ui.radius.value).toFixed(2);
+        ui.lightXVal.textContent    = parseFloat(ui.lightX.value).toFixed(2);
+        ui.lightYVal.textContent    = parseFloat(ui.lightY.value).toFixed(2);
+        ui.metallicVal.textContent  = parseFloat(ui.metallic.value).toFixed(2);
+        ui.roughnessVal.textContent = parseFloat(ui.roughness.value).toFixed(2);
+        ui.aoVal.textContent        = parseFloat(ui.ao.value).toFixed(2);
+        ui.shadowVal.textContent    = parseFloat(ui.shadow.value).toFixed(2);
+        ui.fogVal.textContent       = parseFloat(ui.fog.value).toFixed(2);
+        ui.objXVal.textContent      = parseFloat(ui.objX.value).toFixed(2);
+        ui.objYVal.textContent      = parseFloat(ui.objY.value).toFixed(2);
+        ui.objZVal.textContent      = parseFloat(ui.objZ.value).toFixed(2);
+        ui.planeVal.textContent     = parseFloat(ui.plane.value).toFixed(2);
+      }
+
+      [ui.radius, ui.shape, ui.color, ui.lightX, ui.lightY, ui.bgToggle, ui.metallic, ui.roughness, ui.ao, ui.shadow, ui.fog, ui.objX, ui.objY, ui.objZ, ui.plane].forEach(el => el.addEventListener('input', updateUniforms));
+      updateUniforms();
+
+      let lastTime = performance.now(), frames = 0, startTime = lastTime;
+      function render(now){
+        const t = (now - startTime) * 0.001;
+        gl.uniform1f(U.time, rotating ? t : 0.0);
+        const cam = computeCamera(); gl.uniform3f(U.cameraPos, cam[0], cam[1], cam[2]);
+        gl.uniformMatrix3fv(U.cameraMatrix, false, new Float32Array([Math.cos(yaw),0,-Math.sin(yaw), Math.sin(pitch)*Math.sin(yaw),Math.cos(pitch),Math.sin(pitch)*Math.cos(yaw), Math.cos(pitch)*Math.sin(yaw),-Math.sin(pitch),Math.cos(pitch)*Math.cos(yaw)]));
+        updateUniforms();
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        frames++;
+        if(now - lastTime >= 1000){ ui.fps.textContent = frames; frames=0; lastTime = now; }
+        requestAnimationFrame(render);
+      }
+      requestAnimationFrame(render);
+    })();
+  </script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>WebGL Ray-Marching Demo – All Features + Fog + Bloom</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; color: #eee; font-family: sans-serif; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #controls {
+      position: absolute; top: 10px; left: 10px;
+      background: rgba(0,0,0,0.6); padding: 12px; border-radius: 8px;
+      user-select: none; line-height: 1.4; max-width: 280px;
+    }
+    #controls label { display: block; margin-bottom: 6px; font-size: 0.9em; }
+    #controls input[type=range], #controls select, #controls input[type=color] {
+      width: 100%; margin-top: 4px;
+    }
+    #controls button {
+      width: 100%; margin-top: 8px; padding: 6px; border: none;
+      border-radius: 4px; background: #333; color: #eee;
+      cursor: pointer; font-size: 0.9em;
+    }
+    #stats { margin-top: 8px; font-size: 0.85em; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+  <div id="controls">
+    <label>Radius:<input id="radius" type="range" min="0.5" max="2.5" step="0.01" value="1.00"><span id="radius-val">1.00</span></label>
+    <label>Shape:<select id="shape"><option value="0">Sphere</option><option value="1">Box</option></select></label>
+    <label>Color:<input id="color" type="color" value="#00aaff"></label>
+    <label>Light X:<input id="lightX" type="range" min="-1" max="1" step="0.01" value="1.00"><span id="lightX-val">1.00</span></label>
+    <label>Light Y:<input id="lightY" type="range" min="-1" max="1" step="0.01" value="1.00"><span id="lightY-val">1.00</span></label>
+    <label>Background:<select id="bgToggle"><option value="0">Solid</option><option value="1">Gradient</option></select></label>
+    <label>Metallic:<input id="metallic" type="range" min="0" max="1" step="0.01" value="0.00"><span id="metallic-val">0.00</span></label>
+    <label>Roughness:<input id="roughness" type="range" min="0" max="1" step="0.01" value="0.50"><span id="roughness-val">0.50</span></label>
+    <label>AO Strength:<input id="aoStrength" type="range" min="0" max="1" step="0.01" value="1.00"><span id="aoStrength-val">1.00</span></label>
+    <label>Soft Shadows:<input id="shadowSoft" type="range" min="0.1" max="5.0" step="0.1" value="1.00"><span id="shadowSoft-val">1.00</span></label>
+    <label>Fog Strength:<input id="fogStrength" type="range" min="0" max="1" step="0.01" value="0.00"><span id="fogStrength-val">0.00</span></label>
+    <label>Bloom Strength:<input id="bloomStrength" type="range" min="0" max="1" step="0.01" value="0.00"><span id="bloomStrength-val">0.00</span></label>
+    <label>Object X:<input id="objX" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objX-val">0.00</span></label>
+    <label>Object Y:<input id="objY" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objY-val">0.00</span></label>
+    <label>Object Z:<input id="objZ" type="range" min="-3" max="3" step="0.01" value="0.00"><span id="objZ-val">0.00</span></label>
+    <label>Plane Height:<input id="planeHeight" type="range" min="-2" max="2" step="0.01" value="0.00"><span id="planeHeight-val">0.00</span></label>
+    <button id="screenshot">Download Screenshot</button>
+    <button id="autorotate">Auto-Rotate: Off</button>
+    <div id="stats">FPS: <span id="fps">0</span></div>
+  </div>
+
+  <!-- Vertex shader -->
+  <script id="vertshader" type="x-shader/x-vertex">
+    attribute vec4 position;
+    void main() { gl_Position = position; }
+  </script>
+
+  <!-- Fragment shader -->
+  <script id="fragshader" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform vec2  u_resolution;
+    uniform float u_time;
+    uniform float u_radius;
+    uniform int   u_shapeType;
+    uniform vec3  u_color;
+    uniform vec3  u_lightDir;
+    uniform int   u_bgType;
+    uniform vec3  u_cameraPos;
+    uniform mat3  u_cameraMatrix;
+    uniform float u_metallic;
+    uniform float u_roughness;
+    uniform float u_aoStrength;
+    uniform float u_shadowSoft;
+    uniform float u_fogStrength;
+    uniform float u_bloomStrength;
+    uniform vec3  u_objPos;
+    uniform float u_planeHeight;
+
+    #define MAX_STEPS 100
+    #define MAX_DIST 100.0
+    #define SURF_DIST 0.001
+
+    float sphereSDF(vec3 p, float r) { return length(p) - r; }
+    float boxSDF(vec3 p, float r) {
+      vec3 d = abs(p) - vec3(r);
+      return length(max(d,0.0)) + min(max(d.x,max(d.y,d.z)),0.0);
+    }
+    float shapeSDF(vec3 p) { return (u_shapeType==0) ? sphereSDF(p,u_radius) : boxSDF(p,u_radius); }
+    float planeSDF(vec3 p) { return p.y + u_planeHeight; }
+    float sceneSDF(vec3 p) {
+      float d1 = shapeSDF(p - u_objPos);
+      float d2 = planeSDF(p);
+      return min(d1,d2);
+    }
+    vec3 getNormal(vec3 p) {
+      float d = sceneSDF(p);
+      vec2 e = vec2(0.001,0.0);
+      return normalize(vec3(
+        d - sceneSDF(p - e.xyy),
+        d - sceneSDF(p - e.yxy),
+        d - sceneSDF(p - e.yyx)
+      ));
+    }
+    float rayMarch(vec3 ro, vec3 rd) {
+      float dist = 0.0;
+      for(int i=0;i<MAX_STEPS;i++){
+        vec3 p = ro + rd*dist;
+        float h = sceneSDF(p);
+        dist += h;
+        if(h<SURF_DIST||dist>MAX_DIST) break;
+      }
+      return dist;
+    }
+    float calcAO(vec3 p, vec3 n){ float occ=0.0, sc=1.0; for(int i=1;i<=5;i++){ float h=0.01*float(i); float d=sceneSDF(p+n*h); occ+=(h-d)*sc; sc*=0.5;} return clamp(1.0-occ,0.0,1.0); }
+    float softShadow(vec3 ro, vec3 rd, float k){ float res=1.0, t=0.001; for(int i=0;i<50;i++){ float h=sceneSDF(ro+rd*t); if(h<0.001) return 0.0; res=min(res,k*h/t); t+=clamp(h,0.01,0.2); if(t>MAX_DIST) break;} return clamp(res,0.0,1.0); }
+
+    void main(){
+      vec2 uv = (gl_FragCoord.xy/u_resolution)*2.0-1.0;
+      uv.x *= u_resolution.x/u_resolution.y;
+
+      vec3 bg0 = vec3(0.05);
+      vec3 bg1 = mix(vec3(0.1,0.1,0.2), vec3(0.3,0.4,0.6), (uv.y*0.5+0.5));
+      vec3 bgCol = mix(bg0, bg1, float(u_bgType));
+
+      vec3 ro = u_cameraPos;
+      vec3 rd = normalize(u_cameraMatrix * vec3(uv, -1.5));
+
+      float dist = rayMarch(ro, rd);
+      vec3 col = bgCol;
+
+      if(dist<MAX_DIST){
+        vec3 p = ro + rd*dist;
+        float d1 = shapeSDF(p - u_objPos);
+        float d2 = planeSDF(p);
+        bool hitPlane = d2 < d1;
+        vec3 n = getNormal(p);
+
+        float diff = max(dot(n, normalize(u_lightDir)),0.0);
+        float sh = softShadow(p+n*SURF_DIST*2.0, normalize(u_lightDir), u_shadowSoft);
+        diff *= sh;
+
+        vec3 baseCol = hitPlane? vec3(0.3): u_color;
+        vec3 difCol = baseCol * diff;
+
+        vec3 viewDir = normalize(u_cameraPos - p);
+        vec3 halfDir = normalize(normalize(u_lightDir) + viewDir);
+        float expVal = mix(256.0,16.0,u_roughness);
+        float spec = pow(max(dot(n,halfDir),0.0),expVal);
+        vec3 specCol = vec3(spec);
+
+        col = mix(difCol, specCol, hitPlane?0.0:u_metallic);
+
+        float ao = mix(1.0, calcAO(p,n), u_aoStrength);
+        col *= ao;
+
+        float fogF = clamp(dist/MAX_DIST, 0.0, u_fogStrength);
+        col = mix(col, bgCol, fogF);
+
+        // Bloom effect
+        float thr = 0.8;
+        vec3 bloom = max(col - vec3(thr), vec3(0.0)) * u_bloomStrength;
+        col += bloom;
+      }
+      gl_FragColor = vec4(col,1.0);
+    }
+  </script>
+
+  <script>
+    (function(){
+      const canvas = document.getElementById('glcanvas');
+      const gl = canvas.getContext('webgl'); if(!gl) return alert('WebGL not supported');
+      function resize(){ canvas.width=innerWidth; canvas.height=innerHeight; gl.viewport(0,0,canvas.width,canvas.height);} window.addEventListener('resize',resize); resize();
+      function compile(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; }
+      const vs=compile(gl.VERTEX_SHADER,document.getElementById('vertshader').text), fs=compile(gl.FRAGMENT_SHADER,document.getElementById('fragshader').text);
+      const prog=gl.createProgram(); gl.attachShader(prog,vs); gl.attachShader(prog,fs); gl.linkProgram(prog); gl.useProgram(prog);
+      const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+      const posLoc=gl.getAttribLocation(prog,'position'); gl.enableVertexAttribArray(posLoc); gl.vertexAttribPointer(posLoc,2,gl.FLOAT,false,0,0);
+      const U={resolution:gl.getUniformLocation(prog,'u_resolution'),time:gl.getUniformLocation(prog,'u_time'),radius:gl.getUniformLocation(prog,'u_radius'),shapeType:gl.getUniformLocation(prog,'u_shapeType'),color:gl.getUniformLocation(prog,'u_color'),lightDir:gl.getUniformLocation(prog,'u_lightDir'),bgType:gl.getUniformLocation(prog,'u_bgType'),cameraPos:gl.getUniformLocation(prog,'u_cameraPos'),cameraMatrix:gl.getUniformLocation(prog,'u_cameraMatrix'),metallic:gl.getUniformLocation(prog,'u_metallic'),roughness:gl.getUniformLocation(prog,'u_roughness'),aoStrength:gl.getUniformLocation(prog,'u_aoStrength'),shadowSoft:gl.getUniformLocation(prog,'u_shadowSoft'),fogStrength:gl.getUniformLocation(prog,'u_fogStrength'),bloomStrength:gl.getUniformLocation(prog,'u_bloomStrength'),objPos:gl.getUniformLocation(prog,'u_objPos'),planeHeight:gl.getUniformLocation(prog,'u_planeHeight')};
+      function $(id){return document.getElementById(id);}      const ui={radius:$('radius'),radiusVal:$('radius-val'),shape:$('shape'),color:$('color'),lightX:$('lightX'),lightXVal:$('lightX-val'),lightY:$('lightY'),lightYVal:$('lightY-val'),bgToggle:$('bgToggle'),metallic:$('metallic'),metallicVal:$('metallic-val'),roughness:$('roughness'),roughnessVal:$('roughness-val'),ao:$('aoStrength'),aoVal:$('aoStrength-val'),shadow:$('shadowSoft'),shadowVal:$('shadowSoft-val'),fog:$('fogStrength'),fogVal:$('fogStrength-val'),bloom:$('bloomStrength'),bloomVal:$('bloomStrength-val'),objX:$('objX'),objXVal:$('objX-val'),objY:$('objY'),objYVal:$('objY-val'),objZ:$('objZ'),objZVal:$('objZ-val'),plane:$('planeHeight'),planeVal:$('planeHeight-val'),screenshot:$('screenshot'),autorotate:$('autorotate'),fps:$('fps')};
+      ui.screenshot.onclick=()=>{const a=document.createElement('a');a.href=canvas.toDataURL();a.download='snapshot.png';a.click();};let rotating=false;ui.autorotate.onclick=()=>{rotating=!rotating;ui.autorotate.textContent=rotating?'Auto-Rotate: On':'Auto-Rotate: Off';};
+      let yaw=0,pitch=0,drag=false,lastX=0,lastY=0;const sens=0.005;canvas.addEventListener('mousedown',e=>{drag=true;lastX=e.clientX;lastY=e.clientY;});window.addEventListener('mousemove',e=>{if(!drag) return;const dx=e.clientX-lastX,dy=e.clientY-lastY;lastX=e.clientX;lastY=e.clientY;yaw+=dx*sens;pitch=Math.max(-Math.PI/2+0.1,Math.min(Math.PI/2-0.1,pitch+dy*sens));});window.addEventListener('mouseup',()=>{drag=false;});function computeCamera(){const r=5.0;return[r*Math.cos(pitch)*Math.sin(yaw),r*Math.sin(pitch),r*Math.cos(pitch)*Math.cos(yaw)];}
+      function updateUniforms(){gl.uniform2f(U.resolution,canvas.width,canvas.height);gl.uniform1f(U.radius,parseFloat(ui.radius.value));gl.uniform1i(U.shapeType,parseInt(ui.shape.value));const hex=ui.color.value;gl.uniform3f(U.color,parseInt(hex.substr(1,2),16)/255,parseInt(hex.substr(3,2),16)/255,parseInt(hex.substr(5,2),16)/255);gl.uniform3f(U.lightDir,parseFloat(ui.lightX.value),parseFloat(ui.lightY.value),0.5);gl.uniform1i(U.bgType,parseInt(ui.bgToggle.value));gl.uniform1f(U.metallic,parseFloat(ui.metallic.value));gl.uniform1f(U.roughness,parseFloat(ui.roughness.value));gl.uniform1f(U.aoStrength,parseFloat(ui.ao.value));gl.uniform1f(U.shadowSoft,parseFloat(ui.shadow.value));gl.uniform1f(U.fogStrength,parseFloat(ui.fog.value));gl.uniform1f(U.bloomStrength,parseFloat(ui.bloom.value));gl.uniform3f(U.objPos,parseFloat(ui.objX.value),parseFloat(ui.objY.value),parseFloat(ui.objZ.value));gl.uniform1f(U.planeHeight,parseFloat(ui.plane.value));ui.radiusVal.textContent=parseFloat(ui.radius.value).toFixed(2);ui.lightXVal.textContent=parseFloat(ui.lightX.value).toFixed(2);ui.lightYVal.textContent=parseFloat(ui.lightY.value).toFixed(2);ui.metallicVal.textContent=parseFloat(ui.metallic.value).toFixed(2);ui.roughnessVal.textContent=parseFloat(ui.roughness.value).toFixed(2);ui.aoVal.textContent=parseFloat(ui.ao.value).toFixed(2);ui.shadowVal.textContent=parseFloat(ui.shadow.value).toFixed(2);ui.fogVal.textContent=parseFloat(ui.fog.value).toFixed(2);ui.bloomVal.textContent=parseFloat(ui.bloom.value).toFixed(2);ui.objXVal.textContent=parseFloat(ui.objX.value).toFixed(2);ui.objYVal.textContent=parseFloat(ui.objY.value).toFixed(2);ui.objZVal.textContent=parseFloat(ui.objZ.value).
 
